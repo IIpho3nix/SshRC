@@ -223,15 +223,15 @@ func (r *Room) loadHistory() {
 		}
 	}
 
-	if len(r.history) > 100 {
-		r.history = r.history[len(r.history)-100:]
+	if len(r.history) > 500 {
+		r.history = r.history[len(r.history)-500:]
 	}
 }
 
 func (r *Room) Subscribe(username string) chan ChatMessage {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	c := make(chan ChatMessage, 100)
+	c := make(chan ChatMessage, 500)
 	r.clients[c] = username
 	return c
 }
@@ -256,7 +256,7 @@ func (r *Room) Broadcast(msg ChatMessage) {
 	defer r.mu.Unlock()
 	if !config.Paranoid {
 		r.history = append(r.history, msg)
-		if len(r.history) > 100 {
+		if len(r.history) > 500 {
 			r.history = r.history[1:]
 		}
 
