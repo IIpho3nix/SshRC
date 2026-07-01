@@ -3,12 +3,16 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,6 +26,7 @@ import (
 	bm "charm.land/wish/v2/bubbletea"
 	lm "charm.land/wish/v2/logging"
 	"github.com/charmbracelet/ssh"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 type Config struct {
@@ -31,6 +36,7 @@ type Config struct {
 	ChatlogPath    string
 	UserDBPath     string
 	IdentityPath   string
+	Paranoid       bool
 }
 
 type UserProfile struct {
@@ -50,6 +56,9 @@ func NewUserStore() *UserStore {
 }
 
 func (u *UserStore) Load(path string) error {
+	if config.Paranoid {
+		return nil
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -66,6 +75,9 @@ func (u *UserStore) Load(path string) error {
 }
 
 func (u *UserStore) Save(path string) error {
+	if config.Paranoid {
+		return nil
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -84,6 +96,9 @@ func (u *UserStore) Save(path string) error {
 }
 
 func (u *UserStore) Get(login string) (UserProfile, bool) {
+	if config.Paranoid {
+		return UserProfile{}, false
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -92,10 +107,23 @@ func (u *UserStore) Get(login string) (UserProfile, bool) {
 }
 
 func (u *UserStore) Set(login string, p UserProfile) {
+	if config.Paranoid {
+		return
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
 	u.Users[login] = p
+}
+
+func getTempFilePath(prefix string) (string, error) {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	filename := prefix + hex.EncodeToString(bytes)
+
+	return filepath.Join(os.TempDir(), filename), nil
 }
 
 var config Config
@@ -108,6 +136,7 @@ func loadConfig() {
 	flag.StringVar(&config.ChatlogPath, "chatlog_path", ".data/chat.jsonl", "Path to save chat history")
 	flag.StringVar(&config.UserDBPath, "user_db_path", ".data/users.json", "Path to user database file")
 	flag.StringVar(&config.IdentityPath, "identity_path", ".data/SshRC_ed25519", "Path to SSH identity file")
+	flag.BoolVar(&config.Paranoid, "paranoid", false, "Enable paranoid mode (No logs, no history, random identity, enforce mlkem768x25519-sha256)")
 	flag.Parse()
 
 	if *configFile != "" {
@@ -139,9 +168,15 @@ func loadConfig() {
 					config.UserDBPath = val
 				case "identity_path":
 					config.IdentityPath = val
+				case "paranoid":
+					config.Paranoid, _ = strconv.ParseBool(val)
 				}
 			}
 		}
+	}
+
+	if config.Paranoid {
+		config.IdentityPath, _ = getTempFilePath("")
 	}
 }
 
@@ -170,6 +205,9 @@ func NewRoom() *Room {
 }
 
 func (r *Room) loadHistory() {
+	if config.Paranoid {
+		return
+	}
 	file, err := os.OpenFile(config.ChatlogPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
 		log.Printf("Failed to open chatlog: %v", err)
@@ -216,14 +254,16 @@ func (r *Room) UpdateUsername(c chan ChatMessage, newName string) {
 func (r *Room) Broadcast(msg ChatMessage) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.history = append(r.history, msg)
-	if len(r.history) > 100 {
-		r.history = r.history[1:]
-	}
+	if !config.Paranoid {
+		r.history = append(r.history, msg)
+		if len(r.history) > 100 {
+			r.history = r.history[1:]
+		}
 
-	if r.logFile != nil {
-		data, _ := json.Marshal(msg)
-		r.logFile.Write(append(data, '\n'))
+		if r.logFile != nil {
+			data, _ := json.Marshal(msg)
+			r.logFile.Write(append(data, '\n'))
+		}
 	}
 
 	for c := range r.clients {
@@ -343,7 +383,9 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 				Nick:  m.username,
 				Color: m.userColor,
 			})
-			userStore.Save(config.UserDBPath)
+			if !config.Paranoid {
+				userStore.Save(config.UserDBPath)
+			}
 
 			globalRoom.Broadcast(ChatMessage{
 				Timestamp: time.Now(),
@@ -361,7 +403,9 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 				Nick:  m.username,
 				Color: m.userColor,
 			})
-			userStore.Save(config.UserDBPath)
+			if !config.Paranoid {
+				userStore.Save(config.UserDBPath)
+			}
 
 			m.injectLocalMessage("SYSTEM", "226", "Your color has been updated.")
 		}
@@ -676,6 +720,21 @@ func main() {
 		log.Fatalln(err)
 	}
 
+	if config.Paranoid {
+		s.SetOption(func(srv *ssh.Server) error {
+			srv.ServerConfigCallback = func(ctx ssh.Context) *gossh.ServerConfig {
+				cfg := &gossh.ServerConfig{}
+
+				cfg.KeyExchanges = []string{
+					"mlkem768x25519-sha256",
+				}
+
+				return cfg
+			}
+			return nil
+		})
+	}
+
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
@@ -692,5 +751,8 @@ func main() {
 	defer cancel()
 	if err := s.Shutdown(ctx); err != nil {
 		log.Fatalln(err)
+	}
+	if config.Paranoid {
+		os.Remove(config.IdentityPath)
 	}
 }
