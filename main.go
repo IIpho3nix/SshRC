@@ -14,13 +14,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/cursor"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"charm.land/wish/v2"
+	bm "charm.land/wish/v2/bubbletea"
+	lm "charm.land/wish/v2/logging"
 	"github.com/charmbracelet/ssh"
-	"github.com/charmbracelet/wish"
-	bm "github.com/charmbracelet/wish/bubbletea"
-	lm "github.com/charmbracelet/wish/logging"
 )
 
 type Config struct {
@@ -293,7 +294,7 @@ func waitForMessage(sub chan ChatMessage) tea.Cmd {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, waitForMessage(m.sub))
+	return tea.Batch(cursor.Blink, waitForMessage(m.sub))
 }
 
 func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
@@ -414,14 +415,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.input.Width = m.width - 2
+		m.input.SetWidth(m.width - 2)
 
 	case tea.KeyMsg:
-		if msg.Type == tea.KeyCtrlC || msg.Type == tea.KeyEsc {
+		if msg.Key().Code == tea.KeyEsc {
+			reason := "Client Interrupt"
+			globalRoom.Broadcast(ChatMessage{
+				Timestamp: time.Now(),
+				Username:  "SYSTEM",
+				Color:     "226",
+				Text:      fmt.Sprintf("%s left the chat (%s)", m.username, reason),
+			})
+			close(m.quitChan)
 			return m, tea.Quit
 		}
 
-		if msg.Type == tea.KeyEnter {
+		if msg.Key().Code == tea.KeyEnter {
 			val := strings.TrimSpace(m.input.Value())
 			m.input.SetValue("")
 
@@ -445,6 +454,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.String() {
 
+		case "ctrl+c":
+			reason := "Client Interrupt"
+			globalRoom.Broadcast(ChatMessage{
+				Timestamp: time.Now(),
+				Username:  "SYSTEM",
+				Color:     "226",
+				Text:      fmt.Sprintf("%s left the chat (%s)", m.username, reason),
+			})
+			close(m.quitChan)
+			return m, tea.Quit
 		case "up":
 			m.scrollOffset++
 			return m, nil
@@ -470,9 +489,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) View() string {
+func (m model) View() tea.View {
 	if m.height == 0 {
-		return ""
+		v := tea.NewView("")
+		v.AltScreen = true
+		return v
 	}
 
 	msgHeight := m.height - 3
@@ -535,7 +556,9 @@ func (m model) View() string {
 
 	view.WriteString(m.input.View())
 
-	return view.String()
+	var vret = tea.NewView(view.String())
+
+	return vret
 }
 
 func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
@@ -608,7 +631,7 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 		}
 	}()
 
-	return m, []tea.ProgramOption{tea.WithAltScreen()}
+	return m, []tea.ProgramOption{}
 }
 
 func main() {
