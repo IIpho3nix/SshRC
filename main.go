@@ -1,0 +1,660 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/ssh"
+	"github.com/charmbracelet/wish"
+	bm "github.com/charmbracelet/wish/bubbletea"
+	lm "github.com/charmbracelet/wish/logging"
+)
+
+type Config struct {
+	ServerName     string
+	Port           int
+	ServerPassword string
+	ChatlogPath    string
+	UserDBPath     string
+	IdentityPath   string
+}
+
+type UserProfile struct {
+	Nick  string `json:"nick"`
+	Color string `json:"color"`
+}
+
+type UserStore struct {
+	mu    sync.Mutex
+	Users map[string]UserProfile `json:"users"`
+}
+
+func NewUserStore() *UserStore {
+	return &UserStore{
+		Users: make(map[string]UserProfile),
+	}
+}
+
+func (u *UserStore) Load(path string) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+
+	return json.NewDecoder(file).Decode(&u.Users)
+}
+
+func (u *UserStore) Save(path string) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := json.NewEncoder(f).Encode(u.Users); err != nil {
+		return err
+	}
+
+	return os.Rename(tmp, path)
+}
+
+func (u *UserStore) Get(login string) (UserProfile, bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	file, ok := u.Users[login]
+	return file, ok
+}
+
+func (u *UserStore) Set(login string, p UserProfile) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	u.Users[login] = p
+}
+
+var config Config
+
+func loadConfig() {
+	configFile := flag.String("config", "", "Path to config file (e.g., config.env)")
+	flag.StringVar(&config.ServerName, "server_name", "SshRC", "Name of the server")
+	flag.IntVar(&config.Port, "port", 2222, "Port to listen on")
+	flag.StringVar(&config.ServerPassword, "server_password", "", "Server password (optional)")
+	flag.StringVar(&config.ChatlogPath, "chatlog_path", ".data/chat.jsonl", "Path to save chat history")
+	flag.StringVar(&config.UserDBPath, "user_db_path", ".data/users.json", "Path to user database file")
+	flag.StringVar(&config.IdentityPath, "identity_path", ".data/SshRC_ed25519", "Path to SSH identity file")
+	flag.Parse()
+
+	if *configFile != "" {
+		file, err := os.Open(*configFile)
+		if err != nil {
+			log.Fatalf("Failed to open config file: %v", err)
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				key, val := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+				switch key {
+				case "server_name":
+					config.ServerName = val
+				case "port":
+					fmt.Sscanf(val, "%d", &config.Port)
+				case "server_password":
+					config.ServerPassword = val
+				case "chatlog_path":
+					config.ChatlogPath = val
+				case "user_db_path":
+					config.UserDBPath = val
+				case "identity_path":
+					config.IdentityPath = val
+				}
+			}
+		}
+	}
+}
+
+type ChatMessage struct {
+	Timestamp time.Time `json:"timestamp"`
+	Username  string    `json:"username"`
+	Color     string    `json:"color"`
+	Text      string    `json:"text"`
+	IsAction  bool      `json:"is_action"`
+}
+
+type Room struct {
+	mu      sync.Mutex
+	clients map[chan ChatMessage]string
+	history []ChatMessage
+	logFile *os.File
+}
+
+func NewRoom() *Room {
+	r := &Room{
+		clients: make(map[chan ChatMessage]string),
+		history: make([]ChatMessage, 0),
+	}
+	r.loadHistory()
+	return r
+}
+
+func (r *Room) loadHistory() {
+	file, err := os.OpenFile(config.ChatlogPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Printf("Failed to open chatlog: %v", err)
+		return
+	}
+	r.logFile = file
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var msg ChatMessage
+		if err := json.Unmarshal(scanner.Bytes(), &msg); err == nil {
+			r.history = append(r.history, msg)
+		}
+	}
+
+	if len(r.history) > 100 {
+		r.history = r.history[len(r.history)-100:]
+	}
+}
+
+func (r *Room) Subscribe(username string) chan ChatMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c := make(chan ChatMessage, 100)
+	r.clients[c] = username
+	return c
+}
+
+func (r *Room) Unsubscribe(c chan ChatMessage) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.clients, c)
+	close(c)
+}
+
+func (r *Room) UpdateUsername(c chan ChatMessage, newName string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.clients[c]; ok {
+		r.clients[c] = newName
+	}
+}
+
+func (r *Room) Broadcast(msg ChatMessage) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.history = append(r.history, msg)
+	if len(r.history) > 100 {
+		r.history = r.history[1:]
+	}
+
+	if r.logFile != nil {
+		data, _ := json.Marshal(msg)
+		r.logFile.Write(append(data, '\n'))
+	}
+
+	for c := range r.clients {
+		select {
+		case c <- msg:
+		default:
+		}
+	}
+}
+
+func (r *Room) PrivateMessage(from, to string, msg ChatMessage) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for c, uname := range r.clients {
+		if uname == from || uname == to {
+			select {
+			case c <- msg:
+			default:
+			}
+		}
+	}
+}
+
+var (
+	globalRoom *Room
+	userStore  *UserStore
+)
+
+var (
+	timeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	messageStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
+	systemStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Italic(true)
+	borderStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+)
+
+func formatMessage(m ChatMessage) string {
+	timeStr := timeStyle.Render(fmt.Sprintf("[%s]", m.Timestamp.Format("15:04")))
+	nameStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.Color))
+
+	if m.IsAction {
+		return fmt.Sprintf("%s %s %s", timeStr, nameStyle.Render("* "+m.Username), m.Text)
+	}
+
+	if m.Username == "SYSTEM" {
+		return fmt.Sprintf("%s %s %s", timeStr, nameStyle.Render("<SYSTEM>:"), systemStyle.Render(m.Text))
+	}
+
+	nameStr := nameStyle.Render(fmt.Sprintf("<%s>", m.Username))
+	textStr := messageStyle.Render(m.Text)
+	return fmt.Sprintf("%s %s: %s", timeStr, nameStr, textStr)
+}
+
+type model struct {
+	login        string
+	username     string
+	userColor    string
+	width        int
+	height       int
+	input        textinput.Model
+	sub          chan ChatMessage
+	messages     []ChatMessage
+	quitChan     chan struct{}
+	scrollOffset int
+}
+
+func waitForMessage(sub chan ChatMessage) tea.Cmd {
+	return func() tea.Msg { return <-sub }
+}
+
+func (m model) Init() tea.Cmd {
+	return tea.Batch(textinput.Blink, waitForMessage(m.sub))
+}
+
+func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
+	parts := strings.SplitN(val, " ", 2)
+	cmd := parts[0]
+	args := ""
+	if len(parts) > 1 {
+		args = parts[1]
+	}
+
+	switch cmd {
+	case "/quit":
+		reason := "Disconnected"
+		if args != "" {
+			reason = args
+		}
+		globalRoom.Broadcast(ChatMessage{
+			Timestamp: time.Now(),
+			Username:  "SYSTEM",
+			Color:     "226",
+			Text:      fmt.Sprintf("%s left the chat (%s)", m.username, reason),
+		})
+		close(m.quitChan)
+		return m, tea.Quit
+	case "/nick":
+		if args != "" {
+			oldName := m.username
+			m.username = strings.ReplaceAll(args, " ", "_")
+
+			globalRoom.UpdateUsername(m.sub, m.username)
+
+			userStore.Set(m.login, UserProfile{
+				Nick:  m.username,
+				Color: m.userColor,
+			})
+			userStore.Save(config.UserDBPath)
+
+			globalRoom.Broadcast(ChatMessage{
+				Timestamp: time.Now(),
+				Username:  "SYSTEM",
+				Color:     "226",
+				Text:      fmt.Sprintf("%s is now known as %s", oldName, m.username),
+			})
+		}
+
+	case "/color":
+		if args != "" {
+			m.userColor = args
+
+			userStore.Set(m.login, UserProfile{
+				Nick:  m.username,
+				Color: m.userColor,
+			})
+			userStore.Save(config.UserDBPath)
+
+			m.injectLocalMessage("SYSTEM", "226", "Your color has been updated.")
+		}
+
+	case "/me":
+		if args != "" {
+			globalRoom.Broadcast(ChatMessage{
+				Timestamp: time.Now(),
+				Username:  m.username,
+				Color:     m.userColor,
+				Text:      args,
+				IsAction:  true,
+			})
+		}
+
+	case "/msg":
+		msgParts := strings.SplitN(args, " ", 2)
+		if len(msgParts) == 2 {
+			target := msgParts[0]
+			text := msgParts[1]
+			globalRoom.PrivateMessage(m.username, target, ChatMessage{
+				Timestamp: time.Now(),
+				Username:  fmt.Sprintf("%s -> %s", m.username, target),
+				Color:     "199",
+				Text:      text,
+			})
+		}
+
+	case "/ping":
+		m.injectLocalMessage("SYSTEM", "226", "Pong!")
+
+	case "/help":
+		helpTxt := `Commands:
+		/quit (reason) - Disconnect from the server
+		/me [message] - Sends an action message
+		/nick [username] - Changes your username
+		/msg [username] [message] - Sends a private message
+		/ping - Responds with 'Pong!'
+		/color [color] - Changes your color
+		/help - Display this help message
+		`
+		m.injectLocalMessage("SYSTEM", "226", helpTxt)
+
+	default:
+		m.injectLocalMessage("SYSTEM", "226", "Unknown command. Type /help for a list of commands.")
+	}
+
+	return m, nil
+}
+
+func (m *model) injectLocalMessage(username, color, text string) {
+	m.messages = append(m.messages, ChatMessage{
+		Timestamp: time.Now(),
+		Username:  username,
+		Color:     color,
+		Text:      text,
+	})
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.input.Width = m.width - 2
+
+	case tea.KeyMsg:
+		if msg.Type == tea.KeyCtrlC || msg.Type == tea.KeyEsc {
+			return m, tea.Quit
+		}
+
+		if msg.Type == tea.KeyEnter {
+			val := strings.TrimSpace(m.input.Value())
+			m.input.SetValue("")
+
+			if val == "" {
+				return m, nil
+			}
+
+			if strings.HasPrefix(val, "/") {
+				return m.handleCommand(val)
+			}
+
+			globalRoom.Broadcast(ChatMessage{
+				Timestamp: time.Now(),
+				Username:  m.username,
+				Color:     m.userColor,
+				Text:      val,
+			})
+
+			return m, nil
+		}
+
+		switch msg.String() {
+
+		case "up":
+			m.scrollOffset++
+			return m, nil
+
+		case "down":
+			if m.scrollOffset > 0 {
+				m.scrollOffset--
+			}
+			return m, nil
+		}
+
+	case ChatMessage:
+		m.messages = append(m.messages, msg)
+
+		if m.scrollOffset == 0 {
+			return m, waitForMessage(m.sub)
+		}
+
+		return m, waitForMessage(m.sub)
+	}
+
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+func (m model) View() string {
+	if m.height == 0 {
+		return ""
+	}
+
+	msgHeight := m.height - 3
+	if msgHeight < 0 {
+		msgHeight = 0
+	}
+
+	total := len(m.messages)
+
+	maxOffset := total - msgHeight
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+
+	if m.scrollOffset > maxOffset {
+		m.scrollOffset = maxOffset
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
+
+	start := total - msgHeight - m.scrollOffset
+	end := total - m.scrollOffset
+
+	if start < 0 {
+		start = 0
+	}
+	if end < 0 {
+		end = 0
+	}
+	if end > total {
+		end = total
+	}
+
+	visible := m.messages[start:end]
+
+	var view strings.Builder
+
+	for _, msg := range visible {
+		view.WriteString(formatMessage(msg))
+		view.WriteString("\n")
+	}
+
+	emptyLines := msgHeight - len(visible)
+	if emptyLines > 0 {
+		view.WriteString(strings.Repeat("\n", emptyLines))
+	}
+
+	if m.scrollOffset > 0 {
+		view.WriteString(
+			lipgloss.NewStyle().
+				Foreground(lipgloss.Color("240")).
+				Render("↑ scroll mode (up/down to scroll)") +
+				"\n",
+		)
+	}
+
+	view.WriteString(borderStyle.Render(strings.Repeat("─", m.width)))
+	view.WriteString("\n")
+
+	view.WriteString(m.input.View())
+
+	return view.String()
+}
+
+func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
+	ti := textinput.New()
+	ti.Placeholder = "Type a message..."
+	ti.Focus()
+
+	login := s.User()
+
+	username := login
+	userColor := "15"
+
+	if profile, ok := userStore.Get(login); ok {
+		if profile.Nick != "" {
+			username = profile.Nick
+		}
+		if profile.Color != "" {
+			userColor = profile.Color
+		}
+	}
+
+	subChan := globalRoom.Subscribe(username)
+	quitChan := make(chan struct{})
+
+	globalRoom.mu.Lock()
+	history := make([]ChatMessage, len(globalRoom.history))
+	copy(history, globalRoom.history)
+	globalRoom.mu.Unlock()
+	clientIP := s.RemoteAddr().String()
+
+	joinMsg := ChatMessage{
+		Timestamp: time.Now(),
+		Username:  "SYSTEM",
+		Color:     "226",
+		Text:      fmt.Sprintf("Welcome to %s, %s! Type /help for commands.", config.ServerName, username),
+	}
+	history = append(history, joinMsg)
+
+	globalRoom.Broadcast(ChatMessage{
+		Timestamp: time.Now(),
+		Username:  "SYSTEM",
+		Color:     "226",
+		Text:      fmt.Sprintf("<%s> logged in from %s", username, clientIP),
+	})
+
+	m := model{
+		login:     login,
+		username:  username,
+		userColor: userColor,
+		input:     ti,
+		sub:       subChan,
+		messages:  history,
+		quitChan:  quitChan,
+	}
+
+	go func() {
+		<-s.Context().Done()
+		globalRoom.Unsubscribe(subChan)
+
+		select {
+		case <-quitChan:
+
+		default:
+			globalRoom.Broadcast(ChatMessage{
+				Timestamp: time.Now(),
+				Username:  "SYSTEM",
+				Color:     "226",
+				Text:      fmt.Sprintf("%s dropped connection", m.username),
+			})
+		}
+	}()
+
+	return m, []tea.ProgramOption{tea.WithAltScreen()}
+}
+
+func main() {
+	loadConfig()
+	globalRoom = NewRoom()
+
+	userStore = NewUserStore()
+	if err := userStore.Load(config.UserDBPath); err != nil {
+		log.Printf("user db load error: %v", err)
+	}
+
+	options := []ssh.Option{
+		wish.WithAddress(fmt.Sprintf("0.0.0.0:%d", config.Port)),
+		wish.WithHostKeyPath(config.IdentityPath),
+		wish.WithMiddleware(
+			bm.Middleware(teaHandler),
+			lm.Middleware(),
+		),
+	}
+
+	if config.ServerPassword != "" {
+		options = append(options, wish.WithPasswordAuth(func(ctx ssh.Context, password string) bool {
+			return password == config.ServerPassword
+		}))
+	}
+
+	s, err := wish.NewServer(options...)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	done := make(chan os.Signal, 1)
+	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+	log.Printf("Starting %s on port %d...", config.ServerName, config.Port)
+	go func() {
+		if err = s.ListenAndServe(); err != nil {
+			log.Fatalln(err)
+		}
+	}()
+
+	<-done
+	log.Println("Stopping server...")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		log.Fatalln(err)
+	}
+}
