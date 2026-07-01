@@ -259,21 +259,34 @@ var (
 	borderStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 )
 
-func formatMessage(m ChatMessage) string {
+func formatMessage(m ChatMessage, availableWidth int) string {
 	timeStr := timeStyle.Render(fmt.Sprintf("[%s]", m.Timestamp.Format("15:04")))
 	nameStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.Color))
 
+	var prefix string
 	if m.IsAction {
-		return fmt.Sprintf("%s %s %s", timeStr, nameStyle.Render("* "+m.Username), m.Text)
+		prefix = fmt.Sprintf("%s %s ", timeStr, nameStyle.Render("* "+m.Username))
+	} else if m.Username == "SYSTEM" {
+		prefix = fmt.Sprintf("%s %s ", timeStr, nameStyle.Render("<SYSTEM>:"))
+	} else {
+		prefix = fmt.Sprintf("%s %s: ", timeStr, nameStyle.Render("<"+m.Username+">"))
 	}
 
-	if m.Username == "SYSTEM" {
-		return fmt.Sprintf("%s %s %s", timeStr, nameStyle.Render("<SYSTEM>:"), systemStyle.Render(m.Text))
+	prefixWidth := lipgloss.Width(prefix)
+	maxTextWidth := availableWidth - prefixWidth
+
+	textStyle := lipgloss.NewStyle().Width(maxTextWidth)
+
+	var renderedText string
+	if m.IsAction || m.Username == "SYSTEM" {
+		renderedText = systemStyle.Render(m.Text)
+	} else {
+		renderedText = messageStyle.Render(m.Text)
 	}
 
-	nameStr := nameStyle.Render(fmt.Sprintf("<%s>", m.Username))
-	textStr := messageStyle.Render(m.Text)
-	return fmt.Sprintf("%s %s: %s", timeStr, nameStr, textStr)
+	wrappedText := textStyle.Render(renderedText)
+
+	return prefix + wrappedText
 }
 
 type model struct {
@@ -533,7 +546,7 @@ func (m model) View() tea.View {
 	var view strings.Builder
 
 	for _, msg := range visible {
-		view.WriteString(formatMessage(msg))
+		view.WriteString(formatMessage(msg, m.width))
 		view.WriteString("\n")
 	}
 
