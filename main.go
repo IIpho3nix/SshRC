@@ -267,7 +267,7 @@ func formatMessage(m ChatMessage, availableWidth int) string {
 	if m.IsAction {
 		prefix = fmt.Sprintf("%s %s ", timeStr, nameStyle.Render("* "+m.Username))
 	} else if m.Username == "SYSTEM" {
-		prefix = fmt.Sprintf("%s %s ", timeStr, nameStyle.Render("<SYSTEM>:"))
+		prefix = fmt.Sprintf("%s %s: ", timeStr, nameStyle.Render("<SYSTEM>"))
 	} else {
 		prefix = fmt.Sprintf("%s %s: ", timeStr, nameStyle.Render("<"+m.Username+">"))
 	}
