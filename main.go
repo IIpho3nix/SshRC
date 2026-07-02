@@ -623,7 +623,7 @@ func (m model) View() tea.View {
 		return v
 	}
 
-	msgHeight := m.height - 3
+	msgHeight := m.height - 2
 	if msgHeight < 0 {
 		msgHeight = 0
 	}
