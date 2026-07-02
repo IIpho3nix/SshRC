@@ -541,7 +541,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
-		m.height = msg.Height
+		m.height = msg.Height + 1
 		m.input.SetWidth(m.width - 2)
 
 	case tea.KeyMsg:
@@ -623,14 +623,14 @@ func (m model) View() tea.View {
 		return v
 	}
 
-	msgHeight := m.height - 2
+	msgHeight := m.height - 3
 	if msgHeight < 0 {
 		msgHeight = 0
 	}
 
 	total := len(m.messages)
 
-	maxOffset := total - msgHeight
+	maxOffset := total - msgHeight + 1
 	if maxOffset < 0 {
 		maxOffset = 0
 	}
@@ -642,8 +642,8 @@ func (m model) View() tea.View {
 		m.scrollOffset = 0
 	}
 
-	start := total - msgHeight - m.scrollOffset
-	end := total - m.scrollOffset
+	start := total - msgHeight - m.scrollOffset 
+	end := total - m.scrollOffset + 1
 
 	if start < 0 {
 		start = 0
@@ -667,15 +667,6 @@ func (m model) View() tea.View {
 	emptyLines := msgHeight - len(visible)
 	if emptyLines > 0 {
 		view.WriteString(strings.Repeat("\n", emptyLines))
-	}
-
-	if m.scrollOffset > 0 {
-		view.WriteString(
-			lipgloss.NewStyle().
-				Foreground(lipgloss.Color("240")).
-				Render("↑ scroll mode (up/down to scroll)") +
-				"\n",
-		)
 	}
 
 	view.WriteString(borderStyle.Render(strings.Repeat("─", m.width)))
