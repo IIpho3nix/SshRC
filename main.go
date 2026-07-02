@@ -488,12 +488,21 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) injectLocalMessage(username, color, text string) {
-	m.messages = append(m.messages, ChatMessage{
-		Timestamp: time.Now(),
-		Username:  username,
-		Color:     color,
-		Text:      text,
-	})
+    lines := strings.Split(text, "\n")
+    
+    for _, line := range lines {
+        cleanLine := strings.TrimSpace(line)
+        if cleanLine == "" {
+            continue
+        }
+		
+        m.messages = append(m.messages, ChatMessage{
+            Timestamp: time.Now(),
+            Username:  username,
+            Color:     color,
+            Text:      cleanLine,
+        })
+    }
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
