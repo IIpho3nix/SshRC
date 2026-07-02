@@ -116,14 +116,27 @@ func (u *UserStore) Set(login string, p UserProfile) {
 	u.Users[login] = p
 }
 
+func directoryExists(path string) bool {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return false
+	}
+	return info.IsDir()
+}
+
 func getTempFilePath(prefix string) (string, error) {
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {
 		return "", err
 	}
 	filename := prefix + hex.EncodeToString(bytes)
+	if !directoryExists(filepath.Join(os.TempDir(), "ssh_tmp")) {
+		if err := os.MkdirAll(filepath.Join(os.TempDir(), "ssh_tmp"), 0755); err != nil {
+			return "", err
+		}
+	}
 
-	return filepath.Join(os.TempDir(), filename), nil
+	return filepath.Join(filepath.Join(os.TempDir(), "ssh_tmp"), filename), nil
 }
 
 var config Config
@@ -190,14 +203,19 @@ type ChatMessage struct {
 
 type Room struct {
 	mu      sync.Mutex
-	clients map[chan ChatMessage]string
+	clients map[chan ChatMessage]*ClientInfo
 	history []ChatMessage
 	logFile *os.File
 }
 
+type ClientInfo struct {
+	Username string
+	IP       string
+}
+
 func NewRoom() *Room {
 	r := &Room{
-		clients: make(map[chan ChatMessage]string),
+		clients: make(map[chan ChatMessage]*ClientInfo),
 		history: make([]ChatMessage, 0),
 	}
 	r.loadHistory()
@@ -228,11 +246,11 @@ func (r *Room) loadHistory() {
 	}
 }
 
-func (r *Room) Subscribe(username string) chan ChatMessage {
+func (r *Room) Subscribe(username string, ip string) chan ChatMessage {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	c := make(chan ChatMessage, 500)
-	r.clients[c] = username
+	r.clients[c] = &ClientInfo{Username: username, IP: ip}
 	return c
 }
 
@@ -247,7 +265,7 @@ func (r *Room) UpdateUsername(c chan ChatMessage, newName string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.clients[c]; ok {
-		r.clients[c] = newName
+		r.clients[c].Username = newName
 	}
 }
 
@@ -277,8 +295,8 @@ func (r *Room) Broadcast(msg ChatMessage) {
 func (r *Room) PrivateMessage(from, to string, msg ChatMessage) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for c, uname := range r.clients {
-		if uname == from || uname == to {
+	for c, ci := range r.clients {
+		if ci.Username == from || ci.Username == to {
 			select {
 			case c <- msg:
 			default:
@@ -434,6 +452,18 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 			})
 		}
 
+	case "/who":
+		var sb strings.Builder
+		sb.WriteString("Users:\n")
+
+		globalRoom.mu.Lock()
+		for _, c := range globalRoom.clients {
+			sb.WriteString(fmt.Sprintf(" - %s (%s)\n", c.Username, c.IP))
+		}
+		globalRoom.mu.Unlock()
+
+		m.injectLocalMessage("SYSTEM", "226", sb.String())
+
 	case "/ping":
 		m.injectLocalMessage("SYSTEM", "226", "Pong!")
 
@@ -443,6 +473,7 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 		/me [message] - Sends an action message
 		/nick [username] - Changes your username
 		/msg [username] [message] - Sends a private message
+		/who - Lists all connected users
 		/ping - Responds with 'Pong!'
 		/color [color] - Changes your color
 		/help - Display this help message
@@ -636,15 +667,15 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 			userColor = profile.Color
 		}
 	}
+	clientIP := s.RemoteAddr().String()
 
-	subChan := globalRoom.Subscribe(username)
+	subChan := globalRoom.Subscribe(username, clientIP)
 	quitChan := make(chan struct{})
 
 	globalRoom.mu.Lock()
 	history := make([]ChatMessage, len(globalRoom.history))
 	copy(history, globalRoom.history)
 	globalRoom.mu.Unlock()
-	clientIP := s.RemoteAddr().String()
 
 	joinMsg := ChatMessage{
 		Timestamp: time.Now(),
@@ -747,12 +778,19 @@ func main() {
 
 	<-done
 	log.Println("Stopping server...")
+	if config.Paranoid {
+		time.Sleep(100 * time.Millisecond)
+
+		files := []string{config.IdentityPath + ".pub", config.IdentityPath}
+		for _, f := range files {
+			if err := os.Remove(f); err != nil {
+				log.Printf("Could not delete %s: %v", f, err)
+			}
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := s.Shutdown(ctx); err != nil {
 		log.Fatalln(err)
-	}
-	if config.Paranoid {
-		os.Remove(config.IdentityPath)
 	}
 }
