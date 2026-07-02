@@ -630,7 +630,7 @@ func (m model) View() tea.View {
 
 	total := len(m.messages)
 
-	maxOffset := total - msgHeight
+	maxOffset := total - msgHeight + 1
 	if maxOffset < 0 {
 		maxOffset = 0
 	}
