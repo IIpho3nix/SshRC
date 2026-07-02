@@ -269,20 +269,46 @@ func (r *Room) UpdateUsername(c chan ChatMessage, newName string) {
 	}
 }
 
+func (r *Room) rewriteLogFile() {
+    if r.logFile != nil {
+        r.logFile.Close()
+    }
+
+    tmpPath := config.ChatlogPath + ".tmp"
+    f, err := os.Create(tmpPath)
+    if err != nil {
+        log.Printf("Failed to create temp log: %v", err)
+        return
+    }
+    
+    for _, msg := range r.history {
+        data, _ := json.Marshal(msg)
+        f.Write(append(data, '\n'))
+    }
+    f.Close()
+
+    os.Rename(tmpPath, config.ChatlogPath)
+
+    r.logFile, err = os.OpenFile(config.ChatlogPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+    if err != nil {
+        log.Printf("Failed to re-open log: %v", err)
+    }
+}
+
 func (r *Room) Broadcast(msg ChatMessage) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !config.Paranoid {
-		r.history = append(r.history, msg)
-		if len(r.history) > 500 {
-			r.history = r.history[1:]
-		}
-
-		if r.logFile != nil {
-			data, _ := json.Marshal(msg)
-			r.logFile.Write(append(data, '\n'))
-		}
-	}
+        r.history = append(r.history, msg)
+		
+        if len(r.history) > 500 {
+            r.history = r.history[250:]
+            r.rewriteLogFile()
+        } else if r.logFile != nil {
+            data, _ := json.Marshal(msg)
+            r.logFile.Write(append(data, '\n'))
+        }
+    }
 
 	for c := range r.clients {
 		select {
