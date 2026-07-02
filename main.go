@@ -541,7 +541,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
-		m.height = msg.Height + 1
+		m.height = msg.Height
 		m.input.SetWidth(m.width - 2)
 
 	case tea.KeyMsg:
@@ -630,7 +630,7 @@ func (m model) View() tea.View {
 
 	total := len(m.messages)
 
-	maxOffset := total - msgHeight + 1
+	maxOffset := total - msgHeight
 	if maxOffset < 0 {
 		maxOffset = 0
 	}
