@@ -395,6 +395,10 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 			oldName := m.username
 			m.username = strings.ReplaceAll(args, " ", "_")
 
+			if strings.ToLower(m.username) == "system" {
+    			m.username = "FakeSystem"
+			}
+
 			globalRoom.UpdateUsername(m.sub, m.username)
 
 			userStore.Set(m.login, UserProfile{
@@ -664,6 +668,10 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 	ti.Focus()
 
 	login := s.User()
+
+	if strings.ToLower(login) == "system" {
+    	login = "FakeSystem"
+	}
 
 	username := login
 	userColor := "15"
