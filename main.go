@@ -409,7 +409,7 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 			reason = args
 		}
 		globalRoom.Broadcast(ChatMessage{
-			Timestamp: time.Now(),
+			Timestamp: time.Now().UTC(),
 			Username:  "SYSTEM",
 			Color:     "226",
 			Text:      fmt.Sprintf("%s left the chat (%s)", m.username, reason),
@@ -436,7 +436,7 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 			}
 
 			globalRoom.Broadcast(ChatMessage{
-				Timestamp: time.Now(),
+				Timestamp: time.Now().UTC(),
 				Username:  "SYSTEM",
 				Color:     "226",
 				Text:      fmt.Sprintf("%s is now known as %s", oldName, m.username),
@@ -461,7 +461,7 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 	case "/me":
 		if args != "" {
 			globalRoom.Broadcast(ChatMessage{
-				Timestamp: time.Now(),
+				Timestamp: time.Now().UTC(),
 				Username:  m.username,
 				Color:     m.userColor,
 				Text:      args,
@@ -475,7 +475,7 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 			target := msgParts[0]
 			text := msgParts[1]
 			globalRoom.PrivateMessage(m.username, target, ChatMessage{
-				Timestamp: time.Now(),
+				Timestamp: time.Now().UTC(),
 				Username:  fmt.Sprintf("%s -> %s", m.username, target),
 				Color:     "199",
 				Text:      text,
@@ -527,7 +527,7 @@ func (m *model) injectLocalMessage(username, color, text string) {
         }
 		
         m.messages = append(m.messages, ChatMessage{
-            Timestamp: time.Now(),
+            Timestamp: time.Now().UTC(),
             Username:  username,
             Color:     color,
             Text:      cleanLine,
@@ -548,7 +548,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Key().Code == tea.KeyEsc {
 			reason := "Client Interrupt"
 			globalRoom.Broadcast(ChatMessage{
-				Timestamp: time.Now(),
+				Timestamp: time.Now().UTC(),
 				Username:  "SYSTEM",
 				Color:     "226",
 				Text:      fmt.Sprintf("%s left the chat (%s)", m.username, reason),
@@ -570,7 +570,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			globalRoom.Broadcast(ChatMessage{
-				Timestamp: time.Now(),
+				Timestamp: time.Now().UTC(),
 				Username:  m.username,
 				Color:     m.userColor,
 				Text:      val,
@@ -584,7 +584,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			reason := "Client Interrupt"
 			globalRoom.Broadcast(ChatMessage{
-				Timestamp: time.Now(),
+				Timestamp: time.Now().UTC(),
 				Username:  "SYSTEM",
 				Color:     "226",
 				Text:      fmt.Sprintf("%s left the chat (%s)", m.username, reason),
@@ -712,7 +712,7 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 	globalRoom.mu.Unlock()
 
 	joinMsg := ChatMessage{
-		Timestamp: time.Now(),
+		Timestamp: time.Now().UTC(),
 		Username:  "SYSTEM",
 		Color:     "226",
 		Text:      fmt.Sprintf("Welcome to %s, %s! Type /help for commands.", config.ServerName, username),
@@ -720,7 +720,7 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 	history = append(history, joinMsg)
 
 	globalRoom.Broadcast(ChatMessage{
-		Timestamp: time.Now(),
+		Timestamp: time.Now().UTC(),
 		Username:  "SYSTEM",
 		Color:     "226",
 		Text:      fmt.Sprintf("<%s> logged in from %s", username, clientIP),
@@ -745,7 +745,7 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 
 		default:
 			globalRoom.Broadcast(ChatMessage{
-				Timestamp: time.Now(),
+				Timestamp: time.Now().UTC(),
 				Username:  "SYSTEM",
 				Color:     "226",
 				Text:      fmt.Sprintf("%s dropped connection", m.username),
