@@ -345,6 +345,10 @@ var (
 )
 
 func formatMessage(m ChatMessage, availableWidth int) string {
+	if m.Continuation {
+    	return messageStyle.Render(m.Text)
+	}
+	
 	timeStr := timeStyle.Render(fmt.Sprintf("[%s]", m.Timestamp.Format("15:04")))
 	nameStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.Color))
 
@@ -359,10 +363,6 @@ func formatMessage(m ChatMessage, availableWidth int) string {
 
 	prefixWidth := lipgloss.Width(prefix)
 	maxTextWidth := availableWidth - prefixWidth
-
-	if m.Continuation {
-    	return strings.Repeat(" ", prefixWidth) + messageStyle.Render(m.Text)
-	}
 
 	textStyle := lipgloss.NewStyle().Width(maxTextWidth)
 
