@@ -199,6 +199,7 @@ type ChatMessage struct {
 	Color     string    `json:"color"`
 	Text      string    `json:"text"`
 	IsAction  bool      `json:"is_action"`
+	Continuation bool      `json:"-"`
 }
 
 type Room struct {
@@ -358,6 +359,10 @@ func formatMessage(m ChatMessage, availableWidth int) string {
 
 	prefixWidth := lipgloss.Width(prefix)
 	maxTextWidth := availableWidth - prefixWidth
+
+	if m.Continuation {
+    	return strings.Repeat(" ", prefixWidth) + messageStyle.Render(m.Text)
+	}
 
 	textStyle := lipgloss.NewStyle().Width(maxTextWidth)
 
@@ -519,18 +524,19 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 
 func (m *model) injectLocalMessage(username, color, text string) {
     lines := strings.Split(text, "\n")
-    
-    for _, line := range lines {
-        cleanLine := strings.TrimSpace(line)
-        if cleanLine == "" {
+
+    for i, line := range lines {
+        cleanLine := strings.TrimRight(line, "\r")
+        if strings.TrimSpace(cleanLine) == "" {
             continue
         }
-		
+
         m.messages = append(m.messages, ChatMessage{
-            Timestamp: time.Now().UTC(),
-            Username:  username,
-            Color:     color,
-            Text:      cleanLine,
+            Timestamp:    time.Now().UTC(),
+            Username:     username,
+            Color:        color,
+            Text:         cleanLine,
+            Continuation: i > 0,
         })
     }
 }
