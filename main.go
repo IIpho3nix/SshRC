@@ -17,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"regexp"
 
 	"charm.land/bubbles/v2/cursor"
 	"charm.land/bubbles/v2/textinput"
@@ -37,6 +38,71 @@ type Config struct {
 	UserDBPath     string
 	IdentityPath   string
 	Paranoid       bool
+}
+
+var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+
+const MaxMessageRunes = 1024
+
+func sanitizeText(s string) string {
+	s = strings.ToValidUTF8(s, "")
+	s = ansiRegex.ReplaceAllString(s, "")
+
+	var b strings.Builder
+	b.Grow(len(s))
+
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\t':
+			b.WriteRune(r)
+		case r >= 32 && r != 127:
+			b.WriteRune(r)
+		}
+	}
+
+	out := b.String()
+
+	r := []rune(out)
+	if len(r) > MaxMessageRunes {
+		out = string(r[:MaxMessageRunes])
+	}
+
+	return out
+}
+
+var usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_]{1,20}$`)
+
+func validateNick(n string) (string, bool) {
+	n = sanitizeText(n)
+	n = strings.ReplaceAll(n, " ", "_")
+
+	if strings.EqualFold(n, "system") {
+		return "", false
+	}
+
+	if !usernameRegex.MatchString(n) {
+		return "", false
+	}
+
+	return n, true
+}
+
+var hexColorRegex = regexp.MustCompile(`^#([0-9a-fA-F]{6})$`)
+
+func validateColor(input string) (string, bool) {
+	input = strings.TrimSpace(input)
+
+	if hexColorRegex.MatchString(input) {
+		return strings.ToUpper(input), true
+	}
+
+	if n, err := strconv.Atoi(input); err == nil {
+		if n >= 0 && n <= 255 {
+			return input, true
+		}
+	}
+
+	return "", false
 }
 
 type UserProfile struct {
@@ -194,11 +260,11 @@ func loadConfig() {
 }
 
 type ChatMessage struct {
-	Timestamp time.Time `json:"timestamp"`
-	Username  string    `json:"username"`
-	Color     string    `json:"color"`
-	Text      string    `json:"text"`
-	IsAction  bool      `json:"is_action"`
+	Timestamp    time.Time `json:"timestamp"`
+	Username     string    `json:"username"`
+	Color        string    `json:"color"`
+	Text         string    `json:"text"`
+	IsAction     bool      `json:"is_action"`
 	Continuation bool      `json:"-"`
 }
 
@@ -271,45 +337,46 @@ func (r *Room) UpdateUsername(c chan ChatMessage, newName string) {
 }
 
 func (r *Room) rewriteLogFile() {
-    if r.logFile != nil {
-        r.logFile.Close()
-    }
+	if r.logFile != nil {
+		r.logFile.Close()
+	}
 
-    tmpPath := config.ChatlogPath + ".tmp"
-    f, err := os.Create(tmpPath)
-    if err != nil {
-        log.Printf("Failed to create temp log: %v", err)
-        return
-    }
-    
-    for _, msg := range r.history {
-        data, _ := json.Marshal(msg)
-        f.Write(append(data, '\n'))
-    }
-    f.Close()
+	tmpPath := config.ChatlogPath + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		log.Printf("Failed to create temp log: %v", err)
+		return
+	}
 
-    os.Rename(tmpPath, config.ChatlogPath)
+	for _, msg := range r.history {
+		data, _ := json.Marshal(msg)
+		f.Write(append(data, '\n'))
+	}
+	f.Close()
 
-    r.logFile, err = os.OpenFile(config.ChatlogPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-    if err != nil {
-        log.Printf("Failed to re-open log: %v", err)
-    }
+	os.Rename(tmpPath, config.ChatlogPath)
+
+	r.logFile, err = os.OpenFile(config.ChatlogPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Printf("Failed to re-open log: %v", err)
+	}
 }
 
 func (r *Room) Broadcast(msg ChatMessage) {
+	msg.Text = sanitizeText(msg.Text)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !config.Paranoid {
-        r.history = append(r.history, msg)
-		
-        if len(r.history) > 500 {
-            r.history = r.history[250:]
-            r.rewriteLogFile()
-        } else if r.logFile != nil {
-            data, _ := json.Marshal(msg)
-            r.logFile.Write(append(data, '\n'))
-        }
-    }
+		r.history = append(r.history, msg)
+
+		if len(r.history) > 500 {
+			r.history = r.history[250:]
+			r.rewriteLogFile()
+		} else if r.logFile != nil {
+			data, _ := json.Marshal(msg)
+			r.logFile.Write(append(data, '\n'))
+		}
+	}
 
 	for c := range r.clients {
 		select {
@@ -346,9 +413,9 @@ var (
 
 func formatMessage(m ChatMessage, availableWidth int) string {
 	if m.Continuation {
-    	return messageStyle.Render(m.Text)
+		return messageStyle.Render(m.Text)
 	}
-	
+
 	timeStr := timeStyle.Render(fmt.Sprintf("[%s]", m.Timestamp.Format("15:04")))
 	nameStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(m.Color))
 
@@ -400,7 +467,7 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
-	parts := strings.SplitN(val, " ", 2)
+	parts := strings.SplitN(sanitizeText(val), " ", 2)
 	cmd := parts[0]
 	args := ""
 	if len(parts) > 1 {
@@ -423,12 +490,14 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "/nick":
 		if args != "" {
-			oldName := m.username
-			m.username = strings.ReplaceAll(args, " ", "_")
-
-			if strings.ToLower(m.username) == "system" {
-    			m.username = "FakeSystem"
+			newName, ok := validateNick(args)
+			if !ok {
+				m.injectLocalMessage("SYSTEM", "226", "Invalid nickname (use 1–20 letters, numbers, underscore).")
+				return m, nil
 			}
+
+			oldName := m.username
+			m.username = newName
 
 			globalRoom.UpdateUsername(m.sub, m.username)
 
@@ -436,6 +505,7 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 				Nick:  m.username,
 				Color: m.userColor,
 			})
+
 			if !config.Paranoid {
 				userStore.Save(config.UserDBPath)
 			}
@@ -447,15 +517,21 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 				Text:      fmt.Sprintf("%s is now known as %s", oldName, m.username),
 			})
 		}
-
 	case "/color":
 		if args != "" {
-			m.userColor = args
+			col, ok := validateColor(args)
+			if !ok {
+				m.injectLocalMessage("SYSTEM", "226", "Invalid color. Use #RRGGBB or 0–255 ANSI code.")
+				return m, nil
+			}
+
+			m.userColor = col
 
 			userStore.Set(m.login, UserProfile{
 				Nick:  m.username,
 				Color: m.userColor,
 			})
+
 			if !config.Paranoid {
 				userStore.Save(config.UserDBPath)
 			}
@@ -523,22 +599,22 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) injectLocalMessage(username, color, text string) {
-    lines := strings.Split(text, "\n")
+	lines := strings.Split(text, "\n")
 
-    for i, line := range lines {
-        cleanLine := strings.TrimRight(line, "\r")
-        if strings.TrimSpace(cleanLine) == "" {
-            continue
-        }
+	for i, line := range lines {
+		cleanLine := strings.TrimRight(line, "\r")
+		if strings.TrimSpace(cleanLine) == "" {
+			continue
+		}
 
-        m.messages = append(m.messages, ChatMessage{
-            Timestamp:    time.Now().UTC(),
-            Username:     username,
-            Color:        color,
-            Text:         cleanLine,
-            Continuation: i > 0,
-        })
-    }
+		m.messages = append(m.messages, ChatMessage{
+			Timestamp:    time.Now().UTC(),
+			Username:     username,
+			Color:        color,
+			Text:         cleanLine,
+			Continuation: i > 0,
+		})
+	}
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -565,6 +641,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if msg.Key().Code == tea.KeyEnter {
 			val := strings.TrimSpace(m.input.Value())
+			val = sanitizeText(val)
 			m.input.SetValue("")
 
 			if val == "" {
@@ -648,7 +725,7 @@ func (m model) View() tea.View {
 		m.scrollOffset = 0
 	}
 
-	start := total - msgHeight - m.scrollOffset 
+	start := total - msgHeight - m.scrollOffset
 	end := total - m.scrollOffset + 1
 
 	if start < 0 {
@@ -693,7 +770,7 @@ func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 	login := s.User()
 
 	if strings.ToLower(login) == "system" {
-    	login = "FakeSystem"
+		login = "FakeSystem"
 	}
 
 	username := login
