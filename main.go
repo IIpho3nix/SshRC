@@ -12,12 +12,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"regexp"
 
 	"charm.land/bubbles/v2/cursor"
 	"charm.land/bubbles/v2/textinput"
@@ -215,7 +215,7 @@ func loadConfig() {
 	flag.StringVar(&config.ChatlogPath, "chatlog_path", ".data/chat.jsonl", "Path to save chat history")
 	flag.StringVar(&config.UserDBPath, "user_db_path", ".data/users.json", "Path to user database file")
 	flag.StringVar(&config.IdentityPath, "identity_path", ".data/SshRC_ed25519", "Path to SSH identity file")
-	flag.BoolVar(&config.Paranoid, "paranoid", false, "Enable paranoid mode (No logs, no history, random identity, enforce mlkem768x25519-sha256)")
+	flag.BoolVar(&config.Paranoid, "paranoid", false, "Enable paranoid mode (No logs, no history, random identity)")
 	flag.Parse()
 
 	if *configFile != "" {
@@ -868,20 +868,18 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	if config.Paranoid {
-		s.SetOption(func(srv *ssh.Server) error {
-			srv.ServerConfigCallback = func(ctx ssh.Context) *gossh.ServerConfig {
-				cfg := &gossh.ServerConfig{}
+	s.SetOption(func(srv *ssh.Server) error {
+		srv.ServerConfigCallback = func(ctx ssh.Context) *gossh.ServerConfig {
+			cfg := &gossh.ServerConfig{}
 
-				cfg.KeyExchanges = []string{
-					"mlkem768x25519-sha256",
-				}
-
-				return cfg
+			cfg.KeyExchanges = []string{
+				"mlkem768x25519-sha256",
 			}
-			return nil
-		})
-	}
+
+			return cfg
+		}
+		return nil
+	})
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
