@@ -27,6 +27,7 @@ import (
 	bm "charm.land/wish/v2/bubbletea"
 	lm "charm.land/wish/v2/logging"
 	"github.com/charmbracelet/ssh"
+	"golang.org/x/crypto/bcrypt"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -38,6 +39,7 @@ type Config struct {
 	UserDBPath     string
 	IdentityPath   string
 	Paranoid       bool
+	UserPasswords  bool
 }
 
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
@@ -106,8 +108,159 @@ func validateColor(input string) (string, bool) {
 }
 
 type UserProfile struct {
-	Nick  string `json:"nick"`
-	Color string `json:"color"`
+	Nick         string `json:"nick"`
+	Color        string `json:"color"`
+	PasswordHash string `json:"password_hash,omitempty"`
+}
+
+func (u *UserStore) IsRegistered(login string) bool {
+	if config.Paranoid {
+		return false
+	}
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	profile, ok := u.Users[login]
+	return ok && profile.PasswordHash != ""
+}
+
+func (u *UserStore) Register(login, password string) error {
+	if config.Paranoid {
+		return nil
+	}
+
+	login = strings.TrimSpace(login)
+
+	if login == "" {
+		return fmt.Errorf("invalid login")
+	}
+
+	if len(password) < 4 {
+		return fmt.Errorf("password must be at least 4 characters")
+	}
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if profile, ok := u.Users[login]; ok && profile.PasswordHash != "" {
+		return fmt.Errorf("account is already registered")
+	} else if ok {
+		hash, err := bcrypt.GenerateFromPassword(
+			[]byte(password),
+			bcrypt.DefaultCost,
+		)
+		if err != nil {
+			return err
+		}
+
+		profile.PasswordHash = string(hash)
+		u.Users[login] = profile
+		return nil
+	}
+
+	hash, err := bcrypt.GenerateFromPassword(
+		[]byte(password),
+		bcrypt.DefaultCost,
+	)
+	if err != nil {
+		return err
+	}
+
+	u.Users[login] = UserProfile{
+		Nick:         login,
+		Color:        "15",
+		PasswordHash: string(hash),
+	}
+
+	return nil
+}
+
+func (u *UserStore) resetPassword(login, password string) error {
+	if config.Paranoid {
+		return nil
+	}
+
+	login = strings.TrimSpace(login)
+
+	if login == "" {
+		return fmt.Errorf("invalid login")
+	}
+
+	if len(password) < 4 {
+		return fmt.Errorf("password must be at least 4 characters")
+	}
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if profile, ok := u.Users[login]; ok && profile.PasswordHash != "" {
+		hash, err := bcrypt.GenerateFromPassword(
+			[]byte(password),
+			bcrypt.DefaultCost,
+		)
+		if err != nil {
+			return err
+		}
+
+		profile.PasswordHash = string(hash)
+		u.Users[login] = profile
+		return nil
+	} else if ok {
+		return fmt.Errorf("account not registered")
+	}
+
+	hash, err := bcrypt.GenerateFromPassword(
+		[]byte(password),
+		bcrypt.DefaultCost,
+	)
+	if err != nil {
+		return err
+	}
+
+	u.Users[login] = UserProfile{
+		Nick:         login,
+		Color:        "15",
+		PasswordHash: string(hash),
+	}
+
+	return nil
+}
+
+func (u *UserStore) VerifyPassword(login, password string) bool {
+	if config.Paranoid {
+		return false
+	}
+
+	u.mu.Lock()
+	profile, ok := u.Users[login]
+	u.mu.Unlock()
+
+	if !ok || profile.PasswordHash == "" {
+		return false
+	}
+
+	return bcrypt.CompareHashAndPassword(
+		[]byte(profile.PasswordHash),
+		[]byte(password),
+	) == nil
+}
+
+func (u *UserStore) NickTaken(nick string) bool {
+	if config.Paranoid {
+		return false
+	}
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	for _, profile := range u.Users {
+		if strings.EqualFold(profile.Nick, nick) {
+			return true
+		}
+	}
+
+	return false
 }
 
 type UserStore struct {
@@ -144,17 +297,27 @@ func (u *UserStore) Save(path string) error {
 	if config.Paranoid {
 		return nil
 	}
+
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+
 	tmp := path + ".tmp"
+
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	if err := json.NewEncoder(f).Encode(u.Users); err != nil {
+		f.Close()
+		return err
+	}
+
+	if err := f.Close(); err != nil {
 		return err
 	}
 
@@ -216,6 +379,8 @@ func loadConfig() {
 	flag.StringVar(&config.UserDBPath, "user_db_path", ".data/users.json", "Path to user database file")
 	flag.StringVar(&config.IdentityPath, "identity_path", ".data/SshRC_ed25519", "Path to SSH identity file")
 	flag.BoolVar(&config.Paranoid, "paranoid", false, "Enable paranoid mode (No logs, no history, random identity)")
+	flag.BoolVar(&config.UserPasswords, "user-passwords", false, "Enable per-user passwords for registered accounts")
+
 	flag.Parse()
 
 	if *configFile != "" {
@@ -249,6 +414,8 @@ func loadConfig() {
 					config.IdentityPath = val
 				case "paranoid":
 					config.Paranoid, _ = strconv.ParseBool(val)
+				case "user_passwords":
+					config.UserPasswords, _ = strconv.ParseBool(val)
 				}
 			}
 		}
@@ -475,7 +642,7 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 	}
 
 	switch cmd {
-	case "/quit":
+	case "/quit", "/exit":
 		reason := "Disconnected"
 		if args != "" {
 			reason = args
@@ -501,10 +668,10 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 
 			globalRoom.UpdateUsername(m.sub, m.username)
 
-			userStore.Set(m.login, UserProfile{
-				Nick:  m.username,
-				Color: m.userColor,
-			})
+			profile, _ := userStore.Get(m.login)
+			profile.Nick = newName
+			profile.Color = m.userColor
+			userStore.Set(m.login, profile)
 
 			if !config.Paranoid {
 				userStore.Save(config.UserDBPath)
@@ -527,10 +694,10 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 
 			m.userColor = col
 
-			userStore.Set(m.login, UserProfile{
-				Nick:  m.username,
-				Color: m.userColor,
-			})
+			profile, _ := userStore.Get(m.login)
+			profile.Nick = m.username
+			profile.Color = m.userColor
+			userStore.Set(m.login, profile)
 
 			if !config.Paranoid {
 				userStore.Save(config.UserDBPath)
@@ -578,9 +745,138 @@ func (m *model) handleCommand(val string) (tea.Model, tea.Cmd) {
 	case "/ping":
 		m.injectLocalMessage("SYSTEM", "226", "Pong!")
 
+	case "/register":
+		if !config.UserPasswords {
+			m.injectLocalMessage(
+				"SYSTEM",
+				"226",
+				"User passwords are disabled on this server.",
+			)
+			return m, nil
+		}
+
+		if userStore.IsRegistered(m.login) {
+			m.injectLocalMessage(
+				"SYSTEM",
+				"226",
+				"This account is already registered.",
+			)
+			return m, nil
+		}
+
+		password := strings.TrimSpace(args)
+
+		if password == "" {
+			m.injectLocalMessage(
+				"SYSTEM",
+				"226",
+				"Usage: /register <password>",
+			)
+			return m, nil
+		}
+
+		if len(password) < 4 {
+			m.injectLocalMessage(
+				"SYSTEM",
+				"226",
+				"Password must be at least 4 characters.",
+			)
+			return m, nil
+		}
+
+		if err := userStore.Register(m.login, password); err != nil {
+			m.injectLocalMessage(
+				"SYSTEM",
+				"226",
+				fmt.Sprintf("Registration failed: %v", err),
+			)
+			return m, nil
+		}
+
+		if err := userStore.Save(config.UserDBPath); err != nil {
+			m.injectLocalMessage(
+				"SYSTEM",
+				"226",
+				fmt.Sprintf("Account created, but saving failed: %v", err),
+			)
+			return m, nil
+		}
+
+		m.injectLocalMessage(
+			"SYSTEM",
+			"226",
+			"Registration successful. Your SSH password is now set.",
+		)
+
+	case "/resetpassword":
+		if !config.UserPasswords {
+			m.injectLocalMessage(
+				"SYSTEM",
+				"226",
+				"User passwords are disabled on this server.",
+			)
+			return m, nil
+		}
+
+		if !userStore.IsRegistered(m.login) {
+			m.injectLocalMessage(
+				"SYSTEM",
+				"226",
+				"This account is not registered.",
+			)
+			return m, nil
+		}
+
+		password := strings.TrimSpace(args)
+
+		if password == "" {
+			m.injectLocalMessage(
+				"SYSTEM",
+				"226",
+				"Usage: /resetpassword <password>",
+			)
+			return m, nil
+		}
+
+		if len(password) < 4 {
+			m.injectLocalMessage(
+				"SYSTEM",
+				"226",
+				"Password must be at least 4 characters.",
+			)
+			return m, nil
+		}
+
+		if err := userStore.resetPassword(m.login, password); err != nil {
+			m.injectLocalMessage(
+				"SYSTEM",
+				"226",
+				fmt.Sprintf("Password reset failed: %v", err),
+			)
+			return m, nil
+		}
+
+		if err := userStore.Save(config.UserDBPath); err != nil {
+			m.injectLocalMessage(
+				"SYSTEM",
+				"226",
+				fmt.Sprintf("Password reset, but saving failed: %v", err),
+			)
+			return m, nil
+		}
+
+		m.injectLocalMessage(
+			"SYSTEM",
+			"226",
+			"Password reset successful. Your SSH password is now updated.",
+		)
+
 	case "/help":
 		helpTxt := `Commands:
-		/quit (reason) - Disconnect from the server
+		/register [password] - Register your account
+		/resetpassword [password] - Change your account password
+		/quit [reason] - Disconnect from the server
+		/exit [reason] - Disconnect from the server
 		/me [message] - Sends an action message
 		/nick [username] - Changes your username
 		/msg [username] [message] - Sends a private message
@@ -857,9 +1153,23 @@ func main() {
 		),
 	}
 
-	if config.ServerPassword != "" {
+	if config.ServerPassword != "" || config.UserPasswords {
 		options = append(options, wish.WithPasswordAuth(func(ctx ssh.Context, password string) bool {
-			return password == config.ServerPassword
+			login := ctx.User()
+
+			if strings.EqualFold(login, "system") {
+				login = "FakeSystem"
+			}
+
+			if config.UserPasswords && userStore.IsRegistered(login) {
+				return userStore.VerifyPassword(login, password)
+			}
+
+			if config.ServerPassword != "" {
+				return password == config.ServerPassword
+			}
+
+			return config.UserPasswords
 		}))
 	}
 
